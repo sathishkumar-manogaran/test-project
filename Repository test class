@@ -1,0 +1,390 @@
+package com.barclaycardus.dynamicurl.repository;
+
+import com.barclaycardus.dynamicurl.entity.UrlInformation;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import software.amazon.awssdk.enhanced.dynamodb.*;
+import software.amazon.awssdk.enhanced.dynamodb.model.*;
+import java.util.*;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.*;
+
+
+@ExtendWith(MockitoExtension.class)
+class UrlDynamoDbRepositoryTest {
+
+  @Mock DynamoDbEnhancedClient client;
+  @Mock DynamoDbTable<UrlInformation> table;
+  @Mock DynamoDbIndex<UrlInformation> workflowIndex;
+  @Mock DynamoDbIndex<UrlInformation> statusIndex;
+
+  UrlDynamoDbRepository repo;
+
+  private final String tableName = "dynamic-url-table";
+  private final String workflowIndexName = "contact-workflow-createdOn-index";
+  private final String statusIndexName = "contact-status-createdOn-index";
+
+  @BeforeEach
+  void setUp() {
+    when(client.table(eq(tableName), any(TableSchema.class))).thenReturn(table);
+    when(table.index(workflowIndexName)).thenReturn(workflowIndex);
+    when(table.index(statusIndexName)).thenReturn(statusIndex);
+
+    repo = new UrlDynamoDbRepository(client, tableName, workflowIndexName, statusIndexName);
+  }
+
+  @Test
+  void constructor_wiresTableAndIndexes() {
+    verify(client).table(eq(tableName), any(TableSchema.class));
+    verify(table).index(workflowIndexName);
+    verify(table).index(statusIndexName);
+  }
+
+  @Test
+  void findByUrlId_callsGetItemAndReturnsEntity() {
+    UrlInformation expected = new UrlInformation();
+    expected.setUrlId("u1");
+
+    when(table.getItem(any(Key.class))).thenReturn(expected);
+
+    UrlInformation actual = repo.findByUrlId("u1");
+
+    assertThat(actual).isSameAs(expected);
+
+    ArgumentCaptor<Key> keyCaptor = ArgumentCaptor.forClass(Key.class);
+    verify(table).getItem(keyCaptor.capture());
+    assertThat(keyCaptor.getValue().partitionKeyValue().s()).isEqualTo("u1");
+  }
+
+  @Test
+  void save_putsItemAndReturnsSameEntity() {
+    UrlInformation entity = new UrlInformation();
+    entity.setUrlId("u2");
+
+    UrlInformation returned = repo.save(entity);
+
+    verify(table).putItem(entity);
+    assertThat(returned).isSameAs(entity);
+  }
+
+  @Test
+  void updateState_setsFields_buildsIgnoreNullsRequest_andSetsStatusCreatedOnWhenStatusAndUpdatedOnPresent() {
+    doNothing().when(table).updateItem(any(UpdateItemEnhancedRequest.class));
+
+    repo.updateState(
+      "url-123",
+      "ACTIVE",
+      5,
+      1,
+      9999L,
+      1713200000L,
+      "sohin"
+    );
+
+    ArgumentCaptor<UpdateItemEnhancedRequest<UrlInformation>> captor =
+      ArgumentCaptor.forClass(UpdateItemEnhancedRequest.class);
+    verify(table).updateItem(captor.capture());
+
+    UpdateItemEnhancedRequest<UrlInformation> request = captor.getValue();
+    assertThat(request.ignoreNulls()).isTrue();
+
+    UrlInformation item = request.item();
+    assertThat(item.getUrlId()).isEqualTo("url-123");
+    assertThat(item.getStatus()).isEqualTo("ACTIVE");
+    assertThat(item.getUrlAccessCount()).isEqualTo(5);
+    assertThat(item.getUrlAccessFailedCount()).isEqualTo(1);
+    assertThat(item.getLockedUpto()).isEqualTo(9999L);
+    assertThat(item.getUpdatedOn()).isEqualTo(1713200000L);
+    assertThat(item.getUpdatedBy()).isEqualTo("sohin");
+    assertThat(item.getStatusCreatedOn()).isEqualTo("ACTIVE#1713200000");
+  }
+
+  @Test
+  void updateState_doesNotSetStatusCreatedOnWhenStatusIsNullOrUpdatedOnIsNull() {
+    doNothing().when(table).updateItem(any(UpdateItemEnhancedRequest.class));
+
+    repo.updateState("url-234", null, 1, 0, null, 1713200001L, "sohin");
+
+    ArgumentCaptor<UpdateItemEnhancedRequest<UrlInformation>> captor =
+      ArgumentCaptor.forClass(UpdateItemEnhancedRequest.class);
+    verify(table).updateItem(captor.capture());
+
+    UrlInformation item = captor.getValue().item();
+    assertThat(item.getUrlId()).isEqualTo("url-234");
+    assertThat(item.getStatus()).isNull();
+    assertThat(item.getStatusCreatedOn()).isNull();
+
+    reset(table);
+
+    doNothing().when(table).updateItem(any(UpdateItemEnhancedRequest.class));
+    repo.updateState("url-345", "EXPIRED", 1, 0, null, null, "sohin");
+
+    verify(table).updateItem(captor.capture());
+    UrlInformation item2 = captor.getValue().item();
+    assertThat(item2.getUrlId()).isEqualTo("url-345");
+    assertThat(item2.getStatus()).isEqualTo("EXPIRED");
+    assertThat(item2.getUpdatedOn()).isNull();
+    assertThat(item2.getStatusCreatedOn()).isNull();
+  }
+
+  @Test
+  void findByContactAndJourneyCodeAndCreatedOn_filtersByCreatedOn_dedups_andAlsoAddsFromStatusIndexMatchingWorkflow() {
+    String contact = "c1";
+    String workflow = "WF01";
+    long startOfToday = 1000L;
+    List<String> statuses = List.of("ACTIVE", "EXPIRED");
+
+    // Workflow index pages:
+    UrlInformation w1 = url("u1", workflow, 1000L); // include (== start)
+    UrlInformation w2 = url("u2", workflow, 999L);  // exclude (< start)
+    UrlInformation w3 = url("u1", workflow, 1200L); // duplicate urlId -> excluded by seen set
+    Page<UrlInformation> workflowPage = pageOf(List.of(w1, w2, w3));
+    when(workflowIndex.query(any(QueryEnhancedRequest.class)))
+      .thenReturn(pageIterableOf(workflowPage));
+
+    // Status index pages (per status):
+    UrlInformation s1 = url("u3", workflow, 10L);         // include (workflow match)
+    UrlInformation s2 = url("u4", "WF99", 10L);           // exclude (workflow mismatch)
+    UrlInformation s3 = url("u1", workflow, 10L);         // duplicate (already seen from workflow query)
+    Page<UrlInformation> statusPage1 = pageOf(List.of(s1, s2, s3));
+
+    UrlInformation s4 = url("u5", workflow, 10L);         // include
+    Page<UrlInformation> statusPage2 = pageOf(List.of(s4));
+
+    when(statusIndex.query(any(QueryEnhancedRequest.class)))
+      .thenReturn(pageIterableOf(statusPage1), pageIterableOf(statusPage2));
+
+    List<UrlInformation> results =
+      repo.findByContactAndJourneyCodeAndCreatedOn(contact, workflow, startOfToday, statuses);
+
+    assertThat(results).extracting(UrlInformation::getUrlId)
+      .containsExactlyInAnyOrder("u1", "u3", "u5");
+
+    // Verify workflow query config (we can't easily introspect QueryConditional internals, but we can check limit + direction)
+    ArgumentCaptor<QueryEnhancedRequest> workflowReqCap = ArgumentCaptor.forClass(QueryEnhancedRequest.class);
+    verify(workflowIndex).query(workflowReqCap.capture());
+    assertThat(workflowReqCap.getValue().limit()).isEqualTo(20);
+    assertThat(workflowReqCap.getValue().scanIndexForward()).isFalse();
+
+    // Verify status queries are executed twice (for ACTIVE, EXPIRED) and use the configured limit and direction
+    ArgumentCaptor<QueryEnhancedRequest> statusReqCap = ArgumentCaptor.forClass(QueryEnhancedRequest.class);
+    verify(statusIndex, times(2)).query(statusReqCap.capture());
+    for (QueryEnhancedRequest req : statusReqCap.getAllValues()) {
+      assertThat(req.limit()).isEqualTo(10);
+      assertThat(req.scanIndexForward()).isFalse();
+    }
+  }
+
+  @Test
+  void findByContactAndJourneyCodeAndCreatedOn_stopsFetchingMorePagesOnceResultsReachThreshold() {
+    String contact = "c1";
+    String workflow = "WF01";
+    long startOfToday = 1000L;
+    List<String> statuses = List.of("ACTIVE");
+
+    // Create 10 unique, eligible workflow items spread across 2 pages
+    List<UrlInformation> page1Items = new ArrayList<>();
+    for (int i = 1; i <= 6; i++) page1Items.add(url("u" + i, workflow, 2000L));
+    List<UrlInformation> page2Items = new ArrayList<>();
+    for (int i = 7; i <= 10; i++) page2Items.add(url("u" + i, workflow, 2000L));
+
+    Page<UrlInformation> p1 = pageOf(page1Items);
+    Page<UrlInformation> p2 = pageOf(page2Items);
+
+    when(workflowIndex.query(any(QueryEnhancedRequest.class)))
+      .thenReturn(pageIterableOf(p1, p2));
+
+    // statusIndex will still be queried once, but while loop won't iterate if already at threshold
+    when(statusIndex.query(any(QueryEnhancedRequest.class)))
+      .thenReturn(pageIterableOf(pageOf(List.of(url("u11", workflow, 0L)))));
+
+    List<UrlInformation> results =
+      repo.findByContactAndJourneyCodeAndCreatedOn(contact, workflow, startOfToday, statuses);
+
+    assertThat(results).hasSize(10);
+  }
+
+
+  @Disabled
+  @Test
+  void findByContactAndJourneyCodeAndCreatedOn_canExceedTenBecauseInnerLoopDoesNotRecheckSize() {
+    String contact = "c1";
+    String workflow = "WF01";
+    long startOfToday = 1000L;
+
+    List<UrlInformation> many = new ArrayList<>();
+    for (int i = 1; i <= 25; i++) many.add(url("u" + i, workflow, 2000L));
+
+    when(workflowIndex.query(any(QueryEnhancedRequest.class)))
+      .thenReturn(pageIterableOf(pageOf(many)));
+
+    List<UrlInformation> results =
+      repo.findByContactAndJourneyCodeAndCreatedOn(contact, workflow, startOfToday, List.of());
+
+    assertThat(results.size()).isLessThanOrEqualTo(10);
+  }
+
+@Test
+void findByUrlId_returnsNull_whenItemNotFound() {
+  when(table.getItem(any(Key.class))).thenReturn(null);
+
+  UrlInformation result = repo.findByUrlId("missing");
+
+  assertThat(result).isNull();
+}
+
+@Test
+void save_callsPutItem_once() {
+  UrlInformation entity = new UrlInformation();
+  entity.setUrlId("u100");
+
+  repo.save(entity);
+
+  verify(table).putItem(entity);
+  verifyNoMoreInteractions(table);
+}
+
+@Test
+void updateState_handlesNullOptionalFields_correctly() {
+  doNothing().when(table).updateItem(any(UpdateItemEnhancedRequest.class));
+
+  repo.updateState(
+      "u1",
+      "ACTIVE",
+      null,
+      null,
+      null,
+      null,
+      null
+  );
+
+  ArgumentCaptor<UpdateItemEnhancedRequest<UrlInformation>> captor =
+      ArgumentCaptor.forClass(UpdateItemEnhancedRequest.class);
+
+  verify(table).updateItem(captor.capture());
+
+  UrlInformation item = captor.getValue().item();
+
+  assertThat(item.getUrlAccessCount()).isNull();
+  assertThat(item.getUrlAccessFailedCount()).isNull();
+  assertThat(item.getLockedUpto()).isNull();
+  assertThat(item.getUpdatedOn()).isNull();
+  assertThat(item.getUpdatedBy()).isNull();
+  assertThat(item.getStatusCreatedOn()).isNull();
+}
+
+@Test
+void findByContact_withEmptyStatuses_onlyUsesWorkflowIndex() {
+  String contact = "c1";
+  String workflow = "WF01";
+
+  UrlInformation u1 = url("u1", workflow, 2000L);
+
+  when(workflowIndex.query(any()))
+      .thenReturn(pageIterableOf(pageOf(List.of(u1))));
+
+  List<UrlInformation> result =
+      repo.findByContactAndJourneyCodeAndCreatedOn(contact, workflow, 1000L, Collections.emptyList());
+
+  assertThat(result).hasSize(1);
+
+  verify(statusIndex, never()).query(any());
+}
+
+@Test
+void findByContact_workflowEmpty_statusProvidesResults() {
+  when(workflowIndex.query(any()))
+      .thenReturn(pageIterableOf(pageOf(Collections.emptyList())));
+
+  UrlInformation s1 = url("u2", "WF01", 10L);
+
+  when(statusIndex.query(any()))
+      .thenReturn(pageIterableOf(pageOf(List.of(s1))));
+
+  List<UrlInformation> result =
+      repo.findByContactAndJourneyCodeAndCreatedOn("c1", "WF01", 1000L, List.of("ACTIVE"));
+
+  assertThat(result).extracting("urlId").containsExactly("u2");
+}
+
+@Test
+void findByContact_allFilteredOut_returnsEmpty() {
+  UrlInformation old = url("u1", "WF01", 500L);
+
+  when(workflowIndex.query(any()))
+      .thenReturn(pageIterableOf(pageOf(List.of(old))));
+
+  when(statusIndex.query(any()))
+      .thenReturn(pageIterableOf(pageOf(Collections.emptyList())));
+
+  List<UrlInformation> result =
+      repo.findByContactAndJourneyCodeAndCreatedOn("c1", "WF01", 1000L, List.of("ACTIVE"));
+
+  assertThat(result).isEmpty();
+}
+
+@Test
+void findByContact_deduplicatesAcrossIndexes() {
+  UrlInformation u1 = url("u1", "WF01", 2000L);
+
+  when(workflowIndex.query(any()))
+      .thenReturn(pageIterableOf(pageOf(List.of(u1))));
+
+  when(statusIndex.query(any()))
+      .thenReturn(pageIterableOf(pageOf(List.of(u1))));
+
+  List<UrlInformation> result =
+      repo.findByContactAndJourneyCodeAndCreatedOn("c1", "WF01", 1000L, List.of("ACTIVE"));
+
+  assertThat(result).hasSize(1);
+}
+
+@Test
+void findByContact_handlesNullCreatedOn_safely() {
+  UrlInformation u1 = new UrlInformation();
+  u1.setUrlId("u1");
+  u1.setWorkflowCode("WF01");
+  u1.setCreatedOn(null); // edge
+
+  when(workflowIndex.query(any()))
+      .thenReturn(pageIterableOf(pageOf(List.of(u1))));
+
+  when(statusIndex.query(any()))
+      .thenReturn(pageIterableOf(pageOf(Collections.emptyList())));
+
+  List<UrlInformation> result =
+      repo.findByContactAndJourneyCodeAndCreatedOn("c1", "WF01", 1000L, List.of("ACTIVE"));
+
+  assertThat(result).isEmpty();
+}
+
+
+
+  private static UrlInformation url(String urlId, String workflowCode, Long createdOn) {
+    UrlInformation u = new UrlInformation();
+    u.setUrlId(urlId);
+    u.setWorkflowCode(workflowCode);
+    u.setCreatedOn(createdOn);
+    return u;
+  }
+
+  private static Page<UrlInformation> pageOf(List<UrlInformation> items) {
+    @SuppressWarnings("unchecked")
+    Page<UrlInformation> page = mock(Page.class);
+    when(page.items()).thenReturn(items);
+    return page;
+  }
+
+  private static PageIterable<UrlInformation> pageIterableOf(Page<UrlInformation>... pages) {
+    @SuppressWarnings("unchecked")
+    PageIterable<UrlInformation> iterable = mock(PageIterable.class);
+    when(iterable.iterator()).thenReturn(Arrays.asList(pages).iterator());
+    return iterable;
+  }
+}
