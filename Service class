@@ -3,10 +3,12 @@ package com.barclaycardus.dynamicurl.service.impl;
 import com.barclaycardus.digital.masking.MaskingUtil;
 import com.barclaycardus.dynamicurl.constant.enums.ServiceErrorCodes;
 import com.barclaycardus.dynamicurl.entity.UrlInformation;
-import com.barclaycardus.dynamicurl.exception.*;
+import com.barclaycardus.dynamicurl.exception.GenerateURLValidationException;
+import com.barclaycardus.dynamicurl.exception.InvalidRequestException;
 import com.barclaycardus.dynamicurl.exception.ResourceNotFoundException;
-import com.barclaycardus.dynamicurl.model.*;
+import com.barclaycardus.dynamicurl.exception.UrlStateUpdateException;
 import com.barclaycardus.dynamicurl.model.OperationType;
+import com.barclaycardus.dynamicurl.model.*;
 import com.barclaycardus.dynamicurl.processor.ResponseProcessor;
 import com.barclaycardus.dynamicurl.repository.UrlDynamoDbRepository;
 import com.barclaycardus.dynamicurl.service.DynamicUrlService;
@@ -22,14 +24,11 @@ import org.springframework.stereotype.Service;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.*;
 
-import java.sql.Timestamp;
 import java.time.Instant;
-import java.time.LocalDateTime;
-import java.time.ZoneId;
-import java.time.ZonedDateTime;
-import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeParseException;
-import java.util.*;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 
 @Service
 public class DynamicUrlServiceImpl implements DynamicUrlService {
@@ -47,12 +46,12 @@ public class DynamicUrlServiceImpl implements DynamicUrlService {
 
   @Override
   public GenerateUrlResponseData generateUrl(
-      String correlationID,
-      String traceId,
-      String spanId,
-      GenerateUrlRequestData requestData,
-      String channelId,
-      String userId) {
+    String correlationID,
+    String traceId,
+    String spanId,
+    GenerateUrlRequestData requestData,
+    String channelId,
+    String userId) {
 
     GenerateUrlRequest request = requestData.getData();
 
@@ -112,12 +111,12 @@ public class DynamicUrlServiceImpl implements DynamicUrlService {
 
   @Override
   public URLInformationData updateURLState(
-      String correlationID,
-      String traceId,
-      String spanId,
-      String urlId,
-      UrlStateUpdateReqData reqData,
-      String userId) {
+    String correlationID,
+    String traceId,
+    String spanId,
+    String urlId,
+    UrlStateUpdateReqData reqData,
+    String userId) {
 
     String encodedUser = encode(userId);
     LOG.info("Updating URL state for urlId: {}", encode(urlId));
@@ -143,8 +142,8 @@ public class DynamicUrlServiceImpl implements DynamicUrlService {
 
   private boolean shouldValidate(GenerateUrlRequest request) {
     return request.getJourneyCode() != null &&
-        !(request.getJourneyCode().getValue().equalsIgnoreCase("texttolookup")
-            || request.getJourneyCode().getValue().equalsIgnoreCase("acq"));
+      !(request.getJourneyCode().getValue().equalsIgnoreCase("texttolookup")
+        || request.getJourneyCode().getValue().equalsIgnoreCase("acq"));
   }
 
   private void validateRequestParams(GenerateUrlRequest request) {
@@ -180,12 +179,12 @@ public class DynamicUrlServiceImpl implements DynamicUrlService {
 
   private List<UrlInformation> fetchExistingUrls(GenerateUrlRequest request) {
     return repository.findByContactAndJourneyCodeAndCreatedOn(
-        request.getContact(),
-        request.getJourneyCode().getValue(),
-        0,
-        Arrays.asList(
-            UrlStatusEnum.ADMIN_LOCKED.getValue(),
-            UrlStatusEnum.ACTIVE.getValue()));
+      request.getContact(),
+      request.getJourneyCode().getValue(),
+      0,
+      Arrays.asList(
+        UrlStatusEnum.ADMIN_LOCKED.getValue(),
+        UrlStatusEnum.ACTIVE.getValue()));
   }
 
   private UrlInformation getActiveUrlIfValid(List<UrlInformation> urls, String maskedContact) {
@@ -196,14 +195,14 @@ public class DynamicUrlServiceImpl implements DynamicUrlService {
 
     if (!result.isValid()) {
       throw new GenerateURLValidationException(
-          "Url generation failed for contact: " + maskedContact,
-          ServiceErrorCodes.valueOf(result.getErrorCode()));
+        "Url generation failed for contact: " + maskedContact,
+        ServiceErrorCodes.valueOf(result.getErrorCode()));
     }
 
     return urls.stream()
-        .filter(u -> UrlStatusEnum.ACTIVE.getValue().equals(u.getStatus()))
-        .findFirst()
-        .orElse(null);
+      .filter(u -> UrlStatusEnum.ACTIVE.getValue().equals(u.getStatus()))
+      .findFirst()
+      .orElse(null);
   }
 
   private void persistUrl(UrlInformation prev, UrlInformation current, String userId) {
@@ -218,51 +217,56 @@ public class DynamicUrlServiceImpl implements DynamicUrlService {
     long now = Instant.now().getEpochSecond();
 
     TransactWriteItemsRequest tx = TransactWriteItemsRequest.builder()
-        .transactItems(
-            buildUpdateItem(prev, userId, now),
-            buildPutItem(current))
-        .build();
+      .transactItems(
+        buildUpdateItem(prev, userId, now),
+        buildPutItem(current))
+      .build();
 
     dynamoDbClient.transactWriteItems(tx);
   }
 
   private TransactWriteItem buildUpdateItem(UrlInformation prev, String userId, long now) {
     return TransactWriteItem.builder()
-        .update(Update.builder()
-            .tableName(tableName)
-            .key(Map.of("urlId", AttributeValue.builder().s(prev.getUrlId()).build()))
-            .updateExpression("SET #st = :inactive, updatedOn = :now, updatedBy = :user")
-            .conditionExpression("#st = :active")
-            .expressionAttributeNames(Map.of("#st", "status"))
-            .expressionAttributeValues(Map.of(
-                ":inactive", attr(UrlStatusEnum.INACTIVE.getValue()),
-                ":active", attr(UrlStatusEnum.ACTIVE.getValue()),
-                ":now", num(now),
-                ":user", attr(userId)))
-            .build())
-        .build();
+      .update(Update.builder()
+        .tableName(tableName)
+        .key(Map.of("urlId", AttributeValue.builder().s(prev.getUrlId()).build()))
+        .updateExpression("SET #st = :inactive, updatedOn = :now, updatedBy = :user")
+        .conditionExpression("#st = :active")
+        .expressionAttributeNames(Map.of("#st", "status"))
+        .expressionAttributeValues(Map.of(
+          ":inactive", attr(UrlStatusEnum.INACTIVE.getValue()),
+          ":active", attr(UrlStatusEnum.ACTIVE.getValue()),
+          ":now", num(now),
+          ":user", attr(userId)))
+        .build())
+      .build();
   }
 
   private TransactWriteItem buildPutItem(UrlInformation url) {
     return TransactWriteItem.builder()
-        .put(Put.builder()
-            .tableName(tableName)
-            .item(buildItemMap(url))
-            .conditionExpression("attribute_not_exists(urlId)")
-            .build())
-        .build();
+      .put(Put.builder()
+        .tableName(tableName)
+        .item(buildItemMap(url))
+        .conditionExpression("attribute_not_exists(urlId)")
+        .build())
+      .build();
   }
 
   private Map<String, AttributeValue> buildItemMap(UrlInformation url) {
-    return Map.of(
-        "urlId", attr(url.getUrlId()),
-        "contact", attr(url.getContact()),
-        "workflowCode", attr(url.getWorkflowCode()),
-        "status", attr(url.getStatus()),
-        "createdOn", num(url.getCreatedOn()),
-        "expiryAt", num(url.getExpireOn()),
-        "createdBy", attr(url.getCreatedBy()));
-  }
+
+  Map<String, AttributeValue> map = new HashMap<>();
+
+  addString(map, "urlId", url.getUrlId());
+  addString(map, "contact", url.getContact());
+  addString(map, "workflowCode", url.getWorkflowCode());
+  addString(map, "status", url.getStatus());
+  addString(map, "createdBy", url.getCreatedBy());
+
+  addNumber(map, "createdOn", url.getCreatedOn());
+  addNumber(map, "expiryAt", url.getExpireOn());
+
+  return map;
+}
 
   private UrlInformation getUrlOrThrow(String urlId) {
     UrlInformation url = repository.findByUrlId(urlId);
@@ -281,8 +285,8 @@ public class DynamicUrlServiceImpl implements DynamicUrlService {
     ValidationResult result = validateWithFactory(url, OperationType.URL_STATE_UPDATE.name());
     if (!result.isValid()) {
       throw new UrlStateUpdateException(
-          "Url state update failed",
-          ServiceErrorCodes.valueOf(result.getErrorCode()));
+        "Url state update failed",
+        ServiceErrorCodes.valueOf(result.getErrorCode()));
     }
   }
 
@@ -300,15 +304,21 @@ public class DynamicUrlServiceImpl implements DynamicUrlService {
 
   private void throwBadRequest(String field, String contact) {
     throw new InvalidRequestException(
-        "Invalid " + field + " for contact: " + mask(contact),
-        ServiceErrorCodes.BAD_REQUEST);
+      "Invalid " + field + " for contact: " + mask(contact),
+      ServiceErrorCodes.BAD_REQUEST);
   }
 
-  private AttributeValue attr(String val) {
-    return AttributeValue.builder().s(val).build();
+  private void addString(Map<String, AttributeValue> map, String key, String value) {
+  if (value == null) {
+    throw new IllegalStateException("Missing required field: " + key);
   }
+  map.put(key, AttributeValue.builder().s(value).build());
+}
 
-  private AttributeValue num(Object val) {
-    return AttributeValue.builder().n(String.valueOf(val)).build();
+private void addNumber(Map<String, AttributeValue> map, String key, Long value) {
+  if (value == null) {
+    throw new IllegalStateException("Missing required field: " + key);
   }
+  map.put(key, AttributeValue.builder().n(String.valueOf(value)).build());
+}
 }
