@@ -1,0 +1,653 @@
+package com.barclaycardus.dynamicurl.service.impl;
+
+import com.barclaycardus.dynamicurl.constant.enums.ServiceErrorCodes;
+import com.barclaycardus.dynamicurl.entity.UrlInformation;
+import com.barclaycardus.dynamicurl.exception.GenerateURLValidationException;
+import com.barclaycardus.dynamicurl.exception.InvalidRequestException;
+import com.barclaycardus.dynamicurl.exception.ResourceNotFoundException;
+import com.barclaycardus.dynamicurl.exception.UrlStateUpdateException;
+import com.barclaycardus.dynamicurl.model.*;
+import com.barclaycardus.dynamicurl.processor.ResponseProcessor;
+import com.barclaycardus.dynamicurl.repository.UrlDynamoDbRepository;
+import com.barclaycardus.dynamicurl.service.URLValidatorService;
+import com.barclaycardus.dynamicurl.service.factory.ServiceFactory;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.*;
+import org.mockito.junit.jupiter.MockitoExtension;
+import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import software.amazon.awssdk.services.dynamodb.model.*;
+
+import java.time.Instant;
+import java.util.*;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class DynamicUrlServiceImplTest {
+
+  @Mock DynamoDbClient dynamoDbClient;
+  @Mock UrlDynamoDbRepository repository;
+  @Mock DynamicUrlServiceHelper dynamicUrlServiceHelper;
+  @Mock ServiceFactory factory;
+
+  @Mock URLValidatorService generateUrlValidator;
+  @Mock URLValidatorService validateUrlValidator;
+  @Mock URLValidatorService urlStateUpdateValidator;
+
+  @Mock UrlStateUpdateService urlAccessStateService;
+
+  @InjectMocks DynamicUrlServiceImpl service;
+
+  @BeforeEach
+  void init() throws Exception {
+    setField(service, "tableName", "tbl_dynamic_url");
+  }
+
+  @Test
+  void generateUrl_noExistingUrls_savesNewUrl_andReturnsResponse() {
+    GenerateUrlRequestData reqData = buildGenerateUrlReqData(
+        "test@example.com",
+        JourneyCodeEnum.ACQ_JB,
+        ContactTypeEnum.EMAIL,
+        "partner",
+        "org-uuid",
+        Instant.now().plusSeconds(3600).toString()
+    );
+
+    when(repository.findByContactAndJourneyCodeAndCreatedOn(
+        eq("test@example.com"),
+        eq(reqData.getData().getJourneyCode().getValue()),
+        eq(0L),
+        anyList()
+    )).thenReturn(Collections.emptyList());
+
+    UrlInformation newUrl = new UrlInformation();
+    newUrl.setUrlId("u-new");
+    newUrl.setContact("test@example.com");
+    newUrl.setWorkflowCode(reqData.getData().getJourneyCode().getValue());
+    newUrl.setStatus(UrlStatusEnum.ACTIVE.getValue());
+    newUrl.setUrl("https://x/y");
+    newUrl.setCreatedOn(100L);
+    newUrl.setExpireOn(999L);
+    newUrl.setCreatedBy("channel");
+    newUrl.setUpdatedBy("user");
+
+    when(dynamicUrlServiceHelper.generateNewUrl(any(), anyString(), anyString(), isNull()))
+        .thenReturn(newUrl);
+
+    GenerateUrlResponseData expected = new GenerateUrlResponseData()
+        .data(new GenerateUrlResponse().url("https://x/y"));
+
+    try (MockedStatic<ResponseProcessor> mocked = mockStatic(ResponseProcessor.class)) {
+      mocked.when(() -> ResponseProcessor.processGenerateURLResponse(newUrl)).thenReturn(expected);
+
+      GenerateUrlResponseData actual = service.generateUrl(
+          "corr", "trace", "span",
+          reqData,
+          "channel",
+          "user"
+      );
+
+      assertSame(expected, actual);
+    }
+
+    verify(repository).save(newUrl);
+    verify(dynamoDbClient, never()).transactWriteItems(any(TransactWriteItemsRequest.class));
+    verify(factory, never()).getService(OperationType.GENERATE_URL.name());
+  }
+
+  @Test
+  void generateUrl_existingUrls_validatorInvalid_throwsGenerateURLValidationException() {
+    GenerateUrlRequestData reqData = buildGenerateUrlReqData(
+        "c1",
+        JourneyCodeEnum.ACQ_JB,
+        ContactTypeEnum.EMAIL,
+        "partner",
+        "org-uuid",
+        Instant.now().plusSeconds(3600).toString()
+    );
+
+    UrlInformation existing = new UrlInformation();
+    existing.setUrlId("u1");
+    existing.setStatus(UrlStatusEnum.ACTIVE.getValue());
+
+    when(repository.findByContactAndJourneyCodeAndCreatedOn(anyString(), anyString(), anyLong(), anyList()))
+        .thenReturn(List.of(existing));
+
+    when(factory.getService(OperationType.GENERATE_URL.name())).thenReturn(generateUrlValidator);
+
+    when(generateUrlValidator.validate(anyList())).thenReturn(ValidationResult.invalid(ServiceErrorCodes.URL_GEN_THRESHOLD_REACHED.name()));
+
+    assertThrows(GenerateURLValidationException.class, () ->
+        service.generateUrl("corr", "trace", "span", reqData, "channel", "user")
+    );
+
+    verify(dynamicUrlServiceHelper, never()).generateNewUrl(any(), anyString(), anyString(), any());
+    verify(repository, never()).save(any());
+    verify(dynamoDbClient, never()).transactWriteItems(any());
+  }
+
+  @Test
+  void generateUrl_existingActivePrevUrl_executesTransaction_insteadOfSave() {
+    GenerateUrlRequestData reqData = buildGenerateUrlReqData(
+        "c1",
+        JourneyCodeEnum.ACQ_JB,
+        ContactTypeEnum.EMAIL,
+        "partner",
+        "org-uuid",
+        Instant.now().plusSeconds(3600).toString()
+    );
+
+    UrlInformation prev = new UrlInformation();
+    prev.setUrlId("u-prev");
+    prev.setStatus(UrlStatusEnum.ACTIVE.getValue());
+
+    when(repository.findByContactAndJourneyCodeAndCreatedOn(anyString(), anyString(), anyLong(), anyList()))
+        .thenReturn(List.of(prev));
+
+    when(factory.getService(OperationType.GENERATE_URL.name())).thenReturn(generateUrlValidator);
+    when(generateUrlValidator.validate(anyList())).thenReturn(ValidationResult.valid());
+
+    UrlInformation newUrl = new UrlInformation();
+    newUrl.setUrlId("u-new");
+    newUrl.setContact("c1");
+    newUrl.setWorkflowCode(reqData.getData().getJourneyCode().getValue());
+    newUrl.setStatus(UrlStatusEnum.ACTIVE.getValue());
+    newUrl.setCreatedOn(111L);
+    newUrl.setExpireOn(222L);
+    newUrl.setCreatedBy("channel");
+    newUrl.setUpdatedBy("user");
+
+    when(dynamicUrlServiceHelper.generateNewUrl(any(), anyString(), anyString(), eq(prev)))
+        .thenReturn(newUrl);
+
+    GenerateUrlResponseData expected = new GenerateUrlResponseData()
+        .data(new GenerateUrlResponse().url("dummy"));
+
+    ArgumentCaptor<TransactWriteItemsRequest> txCaptor = ArgumentCaptor.forClass(TransactWriteItemsRequest.class);
+
+    try (MockedStatic<ResponseProcessor> mocked = mockStatic(ResponseProcessor.class)) {
+      mocked.when(() -> ResponseProcessor.processGenerateURLResponse(newUrl)).thenReturn(expected);
+
+      GenerateUrlResponseData actual = service.generateUrl("corr", "trace", "span", reqData, "channel", "user");
+      assertSame(expected, actual);
+    }
+
+    verify(repository, never()).save(any());
+    verify(dynamoDbClient).transactWriteItems(txCaptor.capture());
+
+    TransactWriteItemsRequest tx = txCaptor.getValue();
+    assertEquals(2, tx.transactItems().size());
+
+    Update update = tx.transactItems().get(0).update();
+    assertNotNull(update);
+    assertEquals("tbl_dynamic_url", update.tableName());
+    assertEquals("#st = :active", update.conditionExpression());
+    assertTrue(update.updateExpression().contains("SET #st = :inactive"));
+    assertEquals("status", update.expressionAttributeNames().get("#st"));
+    assertEquals("ACTIVE", update.expressionAttributeValues().get(":active").s());
+    assertEquals("INACTIVE", update.expressionAttributeValues().get(":inactive").s());
+    assertNotNull(update.expressionAttributeValues().get(":now").n());
+    assertEquals("user", update.expressionAttributeValues().get(":user").s());
+
+    Put put = tx.transactItems().get(1).put();
+    assertNotNull(put);
+    assertEquals("tbl_dynamic_url", put.tableName());
+    assertEquals("attribute_not_exists(urlId)", put.conditionExpression());
+    assertEquals("u-new", put.item().get("urlId").s());
+    assertEquals("c1", put.item().get("contact").s());
+    assertEquals(reqData.getData().getJourneyCode().getValue(), put.item().get("workflowCode").s());
+    assertEquals("ACTIVE", put.item().get("status").s());
+  }
+
+  @Test
+  void generateUrl_invalidContact_throwsInvalidRequestException() {
+    GenerateUrlRequestData reqData = buildGenerateUrlReqData(
+        null,
+        JourneyCodeEnum.ACQ_JB,
+        ContactTypeEnum.EMAIL,
+        "partner",
+        "org-uuid",
+        Instant.now().plusSeconds(3600).toString()
+    );
+
+    assertThrows(InvalidRequestException.class, () ->
+        service.generateUrl("corr", "trace", "span", reqData, "channel", "user")
+    );
+  }
+
+  @Test
+  void generateUrl_invalidExpiryFormat_throwsInvalidRequestException() {
+    GenerateUrlRequestData reqData = buildGenerateUrlReqData(
+        "c1",
+        JourneyCodeEnum.ACQ_JB,
+        ContactTypeEnum.EMAIL,
+        "partner",
+        "org-uuid",
+        "NOT_AN_INSTANT"
+    );
+
+    assertThrows(InvalidRequestException.class, () ->
+        service.generateUrl("corr", "trace", "span", reqData, "channel", "user")
+    );
+  }
+
+  @Test
+  void generateUrl_expiryInPast_throwsInvalidRequestException() {
+    GenerateUrlRequestData reqData = buildGenerateUrlReqData(
+        "c1",
+        JourneyCodeEnum.ACQ_JB,
+        ContactTypeEnum.EMAIL,
+        "partner",
+        "org-uuid",
+        Instant.now().minusSeconds(60).toString()
+    );
+
+    assertThrows(InvalidRequestException.class, () ->
+        service.generateUrl("corr", "trace", "span", reqData, "channel", "user")
+    );
+  }
+
+  @Test
+  void generateUrl_journeyAcq_skipsParamValidation_andProceeds() {
+    GenerateUrlRequestData reqData = buildGenerateUrlReqData(
+        null,
+        JourneyCodeEnum.ACQ,
+        ContactTypeEnum.EMAIL,
+        null,
+        null,
+        null
+    );
+
+    when(repository.findByContactAndJourneyCodeAndCreatedOn(any(), any(), anyLong(), anyList()))
+        .thenReturn(Collections.emptyList());
+
+    UrlInformation newUrl = new UrlInformation();
+    newUrl.setUrlId("u-new");
+    newUrl.setUrl("x");
+
+    when(dynamicUrlServiceHelper.generateNewUrl(any(), anyString(), anyString(), isNull()))
+        .thenReturn(newUrl);
+
+    try (MockedStatic<ResponseProcessor> mocked = mockStatic(ResponseProcessor.class)) {
+      mocked.when(() -> ResponseProcessor.processGenerateURLResponse(newUrl))
+          .thenReturn(new GenerateUrlResponseData().data(new GenerateUrlResponse().url("x")));
+
+      assertDoesNotThrow(() ->
+          service.generateUrl("corr", "trace", "span", reqData, "channel", "user")
+      );
+    }
+  }
+
+  @Test
+  void validateUrl_notFound_throwsResourceNotFoundException() {
+    when(repository.findByUrlId("u1")).thenReturn(null);
+    assertThrows(ResourceNotFoundException.class,
+        () -> service.validateUrl("corr", "trace", "span", "u1"));
+  }
+
+  @Test
+  void validateUrl_found_callsValidator_andReturnsResponse() {
+    UrlInformation urlInfo = new UrlInformation();
+    urlInfo.setUrlId("u1");
+
+    when(repository.findByUrlId("u1")).thenReturn(urlInfo);
+    when(factory.getService(OperationType.VALIDATE_URL.name())).thenReturn(validateUrlValidator);
+    when(validateUrlValidator.validate(anyList())).thenReturn(ValidationResult.valid());
+
+    ValidateUrlResponseData expected = new ValidateUrlResponseData()
+        .data(new ValidateUrlResponse().isValid(true));
+
+    try (MockedStatic<ResponseProcessor> mocked = mockStatic(ResponseProcessor.class)) {
+      mocked.when(() -> ResponseProcessor.processValidateUrlResponse(any()))
+          .thenReturn(expected);
+
+      ValidateUrlResponseData actual = service.validateUrl("corr", "trace", "span", "u1");
+      assertSame(expected, actual);
+    }
+
+    ArgumentCaptor<List<UrlInformation>> cap = ArgumentCaptor.forClass(List.class);
+    verify(validateUrlValidator).validate(cap.capture());
+    assertEquals(1, cap.getValue().size());
+    assertSame(urlInfo, cap.getValue().get(0));
+  }
+
+  @Test
+  void getURLDetails_notFound_throwsResourceNotFoundException() {
+    when(repository.findByUrlId("u1")).thenReturn(null);
+    assertThrows(ResourceNotFoundException.class,
+        () -> service.getURLDetails("corr", "trace", "span", "u1"));
+  }
+
+  @Test
+  void getURLDetail_setsUrlExpiryFromEntityExpireOn() {
+    UrlInformation urlInfo = new UrlInformation();
+    urlInfo.setUrlId("u1");
+    urlInfo.setExpireOn(12345L);
+
+    when(repository.findByUrlId("u1")).thenReturn(urlInfo);
+
+    URLInformationData processorResult = new URLInformationData();
+    processorResult.setData(new URLDetails());
+
+    try (MockedStatic<ResponseProcessor> mocked = mockStatic(ResponseProcessor.class)) {
+      mocked.when(() -> ResponseProcessor.processUrlDetailsResponse(urlInfo))
+          .thenReturn(processorResult);
+
+      URLInformationData out = service.getURLDetail("corr", "trace", "span", "u1");
+      assertEquals("12345", out.getData().getUrlExpiry());
+    }
+  }
+
+  @Test
+  void updateURLState_notFound_throwsResourceNotFoundException() {
+    when(repository.findByUrlId("u1")).thenReturn(null);
+
+    UrlStateUpdateReqData req = new UrlStateUpdateReqData()
+        .data(new UrlStateUpdateRequest()
+            .stateAttribute(UrlStateAttrEnum.URL_ACCESS_STATE)
+            .stateAttributeValue("SUCCESS"));
+
+    assertThrows(ResourceNotFoundException.class, () ->
+        service.updateURLState("corr", "trace", "span", "u1", req, "user")
+    );
+  }
+
+  @Test
+  void updateURLState_validatorInvalid_throwsUrlStateUpdateException() {
+    UrlInformation urlInfo = new UrlInformation();
+    urlInfo.setUrlId("u1");
+
+    when(repository.findByUrlId("u1")).thenReturn(urlInfo);
+
+    when(factory.getService(OperationType.URL_STATE_UPDATE.name())).thenReturn(urlStateUpdateValidator);
+    when(urlStateUpdateValidator.validate(anyList())).thenReturn(ValidationResult.invalid(ServiceErrorCodes.URL_LOCKED.name()));
+
+    UrlStateUpdateReqData req = new UrlStateUpdateReqData()
+        .data(new UrlStateUpdateRequest()
+            .stateAttribute(UrlStateAttrEnum.URL_ACCESS_STATE)
+            .stateAttributeValue("FAIL"));
+
+    assertThrows(UrlStateUpdateException.class, () ->
+        service.updateURLState("corr", "trace", "span", "u1", req, "user")
+    );
+
+    verify(factory, never()).getService(UrlStateAttrEnum.URL_ACCESS_STATE.name());
+  }
+
+  @Test
+  void updateURLState_happyPath_delegatesToStateService_andReturnsProcessedResponse() {
+    UrlInformation urlInfo = new UrlInformation();
+    urlInfo.setUrlId("u1");
+
+    when(repository.findByUrlId("u1")).thenReturn(urlInfo);
+
+    when(factory.getService(OperationType.URL_STATE_UPDATE.name())).thenReturn(urlStateUpdateValidator);
+    when(urlStateUpdateValidator.validate(anyList())).thenReturn(ValidationResult.valid());
+
+    UrlStateUpdateRequest inner = new UrlStateUpdateRequest()
+        .stateAttribute(UrlStateAttrEnum.URL_ACCESS_STATE)
+        .stateAttributeValue("SUCCESS");
+
+    UrlStateUpdateReqData req = new UrlStateUpdateReqData().data(inner);
+
+    when(factory.getService(UrlStateAttrEnum.URL_ACCESS_STATE.name())).thenReturn(urlAccessStateService);
+
+    UrlInformation updated = new UrlInformation();
+    updated.setUrlId("u1");
+    updated.setStatus(UrlStatusEnum.ACTIVE.getValue());
+
+    when(urlAccessStateService.updateUrlState(eq(inner), eq(urlInfo), eq("user")))
+        .thenReturn(updated);
+
+    URLInformationData expected = new URLInformationData();
+    expected.setData(new URLDetails().urlId("u1").status("ACTIVE"));
+
+    try (MockedStatic<ResponseProcessor> mocked = mockStatic(ResponseProcessor.class)) {
+      mocked.when(() -> ResponseProcessor.processUrlDetailsResponse(updated)).thenReturn(expected);
+
+      URLInformationData actual = service.updateURLState("corr", "trace", "span", "u1", req, "user");
+      assertSame(expected, actual);
+    }
+
+    verify(urlAccessStateService).updateUrlState(eq(inner), eq(urlInfo), eq("user"));
+  }
+
+  @Test
+void generateUrl_nullPartnerCode_throwsInvalidRequestException() {
+  GenerateUrlRequestData req = buildGenerateUrlReqData(
+      "c1",
+      JourneyCodeEnum.ACQ_JB,
+      ContactTypeEnum.EMAIL,
+      null,
+      "org",
+      Instant.now().plusSeconds(1000).toString()
+  );
+
+  assertThrows(InvalidRequestException.class,
+      () -> service.generateUrl("c","t","s", req, "ch","u"));
+}
+
+@Test
+void generateUrl_nullContactType_throwsInvalidRequestException() {
+  GenerateUrlRequestData req = buildGenerateUrlReqData(
+      "c1",
+      JourneyCodeEnum.ACQ_JB,
+      null,
+      "partner",
+      "org",
+      Instant.now().plusSeconds(1000).toString()
+  );
+
+  assertThrows(InvalidRequestException.class,
+      () -> service.generateUrl("c","t","s", req, "ch","u"));
+}
+
+@Test
+void generateUrl_nullPartnerOrgUUID_throwsInvalidRequestException() {
+  GenerateUrlRequestData req = buildGenerateUrlReqData(
+      "c1",
+      JourneyCodeEnum.ACQ_JB,
+      ContactTypeEnum.EMAIL,
+      "partner",
+      null,
+      Instant.now().plusSeconds(1000).toString()
+  );
+
+  assertThrows(InvalidRequestException.class,
+      () -> service.generateUrl("c","t","s", req, "ch","u"));
+}
+
+@Test
+void generateUrl_nullExpiry_shouldPassValidation() {
+  GenerateUrlRequestData req = buildGenerateUrlReqData(
+      "c1",
+      JourneyCodeEnum.ACQ_JB,
+      ContactTypeEnum.EMAIL,
+      "partner",
+      "org",
+      null
+  );
+
+  when(repository.findByContactAndJourneyCodeAndCreatedOn(any(), any(), anyLong(), anyList()))
+      .thenReturn(Collections.emptyList());
+
+  when(dynamicUrlServiceHelper.generateNewUrl(any(), anyString(), anyString(), isNull()))
+      .thenReturn(new UrlInformation());
+
+  try (MockedStatic<ResponseProcessor> mocked = mockStatic(ResponseProcessor.class)) {
+    mocked.when(() -> ResponseProcessor.processGenerateURLResponse(any()))
+        .thenReturn(new GenerateUrlResponseData());
+
+    assertDoesNotThrow(() ->
+        service.generateUrl("c","t","s", req, "ch","u"));
+  }
+}
+
+@Test
+void generateUrl_existingButNoActiveUrl_shouldSaveNewUrl() {
+  GenerateUrlRequestData req = buildGenerateUrlReqData(
+      "c1",
+      JourneyCodeEnum.ACQ_JB,
+      ContactTypeEnum.EMAIL,
+      "partner",
+      "org",
+      Instant.now().plusSeconds(1000).toString()
+  );
+
+  UrlInformation old = new UrlInformation();
+  old.setStatus(UrlStatusEnum.INACTIVE.getValue());
+
+  when(repository.findByContactAndJourneyCodeAndCreatedOn(any(), any(), anyLong(), anyList()))
+      .thenReturn(List.of(old));
+
+  when(factory.getService(OperationType.GENERATE_URL.name())).thenReturn(generateUrlValidator);
+  when(generateUrlValidator.validate(anyList())).thenReturn(ValidationResult.valid());
+
+  UrlInformation newUrl = new UrlInformation();
+  when(dynamicUrlServiceHelper.generateNewUrl(any(), anyString(), anyString(), isNull()))
+      .thenReturn(newUrl);
+
+  try (MockedStatic<ResponseProcessor> mocked = mockStatic(ResponseProcessor.class)) {
+    mocked.when(() -> ResponseProcessor.processGenerateURLResponse(newUrl))
+        .thenReturn(new GenerateUrlResponseData());
+
+    service.generateUrl("c","t","s", req, "ch","u");
+  }
+
+  verify(repository).save(newUrl);
+  verify(dynamoDbClient, never()).transactWriteItems(any());
+}
+
+@Test
+void validateUrl_invalidResult_stillReturnsResponse() {
+  UrlInformation urlInfo = new UrlInformation();
+  urlInfo.setUrlId("u1");
+
+  when(repository.findByUrlId("u1")).thenReturn(urlInfo);
+  when(factory.getService(OperationType.VALIDATE_URL.name())).thenReturn(validateUrlValidator);
+  when(validateUrlValidator.validate(anyList()))
+      .thenReturn(ValidationResult.invalid(ServiceErrorCodes.URL_EXPIRED.name()));
+
+  ValidateUrlResponseData expected = new ValidateUrlResponseData();
+
+  try (MockedStatic<ResponseProcessor> mocked = mockStatic(ResponseProcessor.class)) {
+    mocked.when(() -> ResponseProcessor.processValidateUrlResponse(any()))
+        .thenReturn(expected);
+
+    ValidateUrlResponseData actual =
+        service.validateUrl("c","t","s","u1");
+
+    assertSame(expected, actual);
+  }
+}
+
+@Test
+void getURLDetail_notFound_throwsResourceNotFoundException() {
+  when(repository.findByUrlId("u1")).thenReturn(null);
+
+  assertThrows(ResourceNotFoundException.class,
+      () -> service.getURLDetail("c","t","s","u1"));
+}
+
+@Test
+void updateURLState_encodesUserId_beforePassing() {
+  UrlInformation urlInfo = new UrlInformation();
+  urlInfo.setUrlId("u1");
+
+  when(repository.findByUrlId("u1")).thenReturn(urlInfo);
+
+  when(factory.getService(OperationType.URL_STATE_UPDATE.name())).thenReturn(urlStateUpdateValidator);
+  when(urlStateUpdateValidator.validate(anyList())).thenReturn(ValidationResult.valid());
+
+  UrlStateUpdateRequest inner = new UrlStateUpdateRequest()
+      .stateAttribute(UrlStateAttrEnum.URL_ACCESS_STATE)
+      .stateAttributeValue("SUCCESS");
+
+  UrlStateUpdateReqData req = new UrlStateUpdateReqData().data(inner);
+
+  when(factory.getService(UrlStateAttrEnum.URL_ACCESS_STATE.name())).thenReturn(urlAccessStateService);
+
+  when(urlAccessStateService.updateUrlState(any(), any(), anyString()))
+      .thenReturn(new UrlInformation());
+
+  try (MockedStatic<ResponseProcessor> mocked = mockStatic(ResponseProcessor.class)) {
+    mocked.when(() -> ResponseProcessor.processUrlDetailsResponse(any()))
+        .thenReturn(new URLInformationData());
+
+    service.updateURLState("c","t","s","u1", req, "<script>");
+
+    verify(urlAccessStateService).updateUrlState(any(), any(), eq("&lt;script&gt;"));
+  }
+}
+
+@Test
+void generateUrl_transactionFails_shouldPropagateException() {
+  GenerateUrlRequestData req = buildGenerateUrlReqData(
+      "c1",
+      JourneyCodeEnum.ACQ_JB,
+      ContactTypeEnum.EMAIL,
+      "partner",
+      "org",
+      Instant.now().plusSeconds(1000).toString()
+  );
+
+  UrlInformation prev = new UrlInformation();
+  prev.setUrlId("u-prev");
+  prev.setStatus(UrlStatusEnum.ACTIVE.getValue());
+
+  when(repository.findByContactAndJourneyCodeAndCreatedOn(any(), any(), anyLong(), anyList()))
+      .thenReturn(List.of(prev));
+
+  when(factory.getService(OperationType.GENERATE_URL.name())).thenReturn(generateUrlValidator);
+  when(generateUrlValidator.validate(anyList())).thenReturn(ValidationResult.valid());
+
+  UrlInformation newUrl = new UrlInformation();
+  newUrl.setUrlId("u-new");
+  newUrl.setContact("c1");
+  newUrl.setWorkflowCode("wf");
+  newUrl.setStatus("ACTIVE");
+  newUrl.setCreatedOn(1L);
+  newUrl.setExpireOn(2L);
+  newUrl.setCreatedBy("c");
+
+  when(dynamicUrlServiceHelper.generateNewUrl(any(), anyString(), anyString(), any()))
+      .thenReturn(newUrl);
+
+  doThrow(RuntimeException.class)
+      .when(dynamoDbClient).transactWriteItems(any());
+
+  assertThrows(RuntimeException.class, () ->
+      service.generateUrl("c","t","s", req, "ch","u"));
+}
+
+  private static GenerateUrlRequestData buildGenerateUrlReqData(
+      String contact,
+      JourneyCodeEnum journey,
+      ContactTypeEnum contactType,
+      String partnerCode,
+      String partnerOrgUuid,
+      String urlExpiry
+  ) {
+    GenerateUrlRequest r = new GenerateUrlRequest();
+    r.setContact(contact);
+    r.setJourneyCode(journey);
+    r.setContactType(contactType);
+    r.setPartnerCode(partnerCode);
+    r.setPartnerOrgUUID(partnerOrgUuid);
+    r.setUrlExpiry(urlExpiry);
+
+    GenerateUrlRequestData d = new GenerateUrlRequestData();
+    d.setData(r);
+    return d;
+  }
+
+  private static void setField(Object target, String fieldName, Object value) throws Exception {
+    var f = target.getClass().getDeclaredField(fieldName);
+    f.setAccessible(true);
+    f.set(target, value);
+  }
+}
