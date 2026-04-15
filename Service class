@@ -1,0 +1,321 @@
+package com.barclaycardus.dynamicurl.service.impl;
+
+import com.barclaycardus.digital.masking.MaskingUtil;
+import com.barclaycardus.dynamicurl.constant.enums.ServiceErrorCodes;
+import com.barclaycardus.dynamicurl.entity.UrlInformation;
+import com.barclaycardus.dynamicurl.exception.*;
+import com.barclaycardus.dynamicurl.exception.ResourceNotFoundException;
+import com.barclaycardus.dynamicurl.model.*;
+import com.barclaycardus.dynamicurl.model.OperationType;
+import com.barclaycardus.dynamicurl.processor.ResponseProcessor;
+import com.barclaycardus.dynamicurl.repository.UrlDynamoDbRepository;
+import com.barclaycardus.dynamicurl.service.DynamicUrlService;
+import com.barclaycardus.dynamicurl.service.URLValidatorService;
+import com.barclaycardus.dynamicurl.service.factory.ServiceFactory;
+import org.apache.commons.collections.CollectionUtils;
+import org.owasp.encoder.Encode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import software.amazon.awssdk.services.dynamodb.model.*;
+
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.*;
+
+@Service
+public class DynamicUrlServiceImpl implements DynamicUrlService {
+  @Autowired
+  private DynamoDbClient dynamoDbClient;
+  @Autowired
+  private UrlDynamoDbRepository repository;
+  @Autowired
+  DynamicUrlServiceHelper dynamicUrlServiceHelper;
+  @Autowired
+  ServiceFactory factory;
+  @Value("${aws.dynamodb.table-name}")
+  String tableName;
+
+  private static final Logger LOG = LoggerFactory.getLogger(DynamicUrlServiceImpl.class);
+
+  @Override
+  public GenerateUrlResponseData generateUrl(
+    String correlationID,
+    String xB3TraceId,
+    String xB3SpanId,
+    GenerateUrlRequestData generateUrlRequestData,
+    String xChannelId,
+    String xUserId) {
+
+    GenerateUrlRequest request = generateUrlRequestData.getData();
+
+    if (request.getJourneyCode() != null &&
+      !(request.getJourneyCode().getValue().equalsIgnoreCase("texttolookup")
+        || request.getJourneyCode().getValue().equalsIgnoreCase("acq"))) {
+      validateRequestParams(request);
+    }
+
+    String userId = Encode.forJava(xUserId);
+    String maskedContact = MaskingUtil.maskContactInfo(
+      Encode.forJava(request.getContact()));
+
+    LOG.info("Generating URL for contact: {}", maskedContact);
+
+    List<UrlInformation> existingUrls =
+      repository.findByContactAndJourneyCodeAndCreatedOn(
+        request.getContact(),
+        request.getJourneyCode().getValue(),
+        0,
+        Arrays.asList(
+          UrlStatusEnum.ADMIN_LOCKED.getValue(),
+          UrlStatusEnum.ACTIVE.getValue()
+        )
+      );
+
+    UrlInformation prevUrl = null;
+
+    if (CollectionUtils.isNotEmpty(existingUrls)) {
+      URLValidatorService validator =
+        factory.getService(OperationType.GENERATE_URL.name());
+
+      ValidationResult result = validator.validate(existingUrls);
+
+      if (!result.isValid()) {
+        throw new GenerateURLValidationException(
+          "Url generation failed for contact: " + maskedContact,
+          ServiceErrorCodes.valueOf(result.getErrorCode()));
+      }
+
+      prevUrl = existingUrls.stream()
+        .filter(u -> UrlStatusEnum.ACTIVE.getValue().equals(u.getStatus()))
+        .findFirst()
+        .orElse(null);
+    }
+
+    UrlInformation newUrl =
+      dynamicUrlServiceHelper.generateNewUrl(
+        request, xUserId, xChannelId, prevUrl);
+
+    if (prevUrl != null) {
+      executeTransaction(prevUrl, newUrl, userId);
+    } else {
+      repository.save(newUrl);
+    }
+
+    LOG.info("URL generated successfully for contact: {}", maskedContact);
+
+    return ResponseProcessor.processGenerateURLResponse(newUrl);
+  }
+
+  private void executeTransaction(UrlInformation prevUrl,
+                                  UrlInformation newUrl,
+                                  String userId) {
+
+    long now = Instant.now().getEpochSecond();
+
+    Map<String, AttributeValue> updateKey = Map.of(
+      "urlId", AttributeValue.builder().s(prevUrl.getUrlId()).build()
+    );
+
+    Map<String, AttributeValue> newItem = buildItemMap(newUrl);
+
+    TransactWriteItemsRequest tx = TransactWriteItemsRequest.builder()
+      .transactItems(
+        TransactWriteItem.builder()
+          .update(Update.builder()
+            .tableName(tableName)
+            .key(updateKey)
+            .updateExpression("SET #st = :inactive, updatedOn = :now, updatedBy = :user")
+            .conditionExpression("#st = :active")
+            .expressionAttributeNames(Map.of("#st", "status"))
+            .expressionAttributeValues(Map.of(
+              ":inactive", AttributeValue.builder()
+                .s(UrlStatusEnum.INACTIVE.getValue()).build(),
+              ":active", AttributeValue.builder()
+                .s(UrlStatusEnum.ACTIVE.getValue()).build(),
+              ":now", AttributeValue.builder()
+                .n(String.valueOf(now)).build(),
+              ":user", AttributeValue.builder()
+                .s(userId).build()
+            ))
+            .build())
+          .build(),
+        TransactWriteItem.builder()
+          .put(Put.builder()
+            .tableName(tableName)
+            .item(newItem)
+            .conditionExpression("attribute_not_exists(urlId)")
+            .build())
+          .build()
+      )
+      .build();
+
+    dynamoDbClient.transactWriteItems(tx);
+  }
+
+  private Map<String, AttributeValue> buildItemMap(UrlInformation url) {
+
+    return Map.of(
+      "urlId", AttributeValue.builder().s(url.getUrlId()).build(),
+      "contact", AttributeValue.builder().s(url.getContact()).build(),
+      "workflowCode", AttributeValue.builder().s(url.getWorkflowCode()).build(),
+      "status", AttributeValue.builder().s(url.getStatus()).build(),
+      "createdOn", AttributeValue.builder()
+        .n(String.valueOf(url.getCreatedOn())).build(),
+      "expiryAt", AttributeValue.builder()
+        .n(String.valueOf(url.getExpireOn())).build(),
+      "createdBy", AttributeValue.builder().s(url.getCreatedBy()).build()
+    );
+  }
+
+  private void validateRequestParams(GenerateUrlRequest request) {
+
+    if (isNullOrEmpty(request.getContact())) {
+      throwBadRequest("Contact", request.getContact());
+    }
+
+    if (isNullOrEmpty(request.getPartnerCode())) {
+      throwBadRequest("PartnerCode", request.getContact());
+    }
+
+    if (request.getContactType() == null) {
+      throwBadRequest("ContactType", request.getContact());
+    }
+
+    if (isInvalidUrlExpiry(request.getUrlExpiry())) {
+      throwBadRequest("UrlExpiry", request.getContact());
+    }
+
+    if (isNullOrEmpty(request.getPartnerOrgUUID())) {
+      throwBadRequest("PartnerOrgUUID", request.getContact());
+    }
+  }
+
+  private boolean isInvalidUrlExpiry(String expiry) {
+    if (expiry == null || expiry.isEmpty()) return false;
+
+    try {
+      Instant expiryTime = Instant.parse(expiry);
+      return expiryTime.isBefore(Instant.now());
+    } catch (Exception e) {
+      throw new InvalidRequestException(
+        "Invalid expiry format",
+        ServiceErrorCodes.BAD_REQUEST);
+    }
+  }
+
+  private void throwBadRequest(String field, String contact) {
+    String masked = MaskingUtil.maskContactInfo(contact);
+    LOG.warn("Invalid field: {}", field);
+
+    throw new InvalidRequestException(
+      "Invalid " + field + " for contact: " + masked,
+      ServiceErrorCodes.BAD_REQUEST);
+  }
+
+  private boolean isNullOrEmpty(String val) {
+    return val == null || val.isEmpty();
+  }
+
+  @Override
+  public ValidateUrlResponseData validateUrl(String correlationID, String xB3TraceId, String xB3SpanId, String urlId) {
+    LOG.info("Validating URL Id: {}", Encode.forJava(urlId));
+    UrlInformation urlInformation = repository.findByUrlId(urlId);
+    if(urlInformation == null) {
+      throw new ResourceNotFoundException("URL not found for urlId:" + urlId);
+    }
+    ValidationResult result = validate(urlInformation, OperationType.VALIDATE_URL.name());
+    LOG.info("URL Id: {} isValid: {}", Encode.forJava(urlId), result.isValid());
+    return ResponseProcessor.processValidateUrlResponse(result);
+  }
+
+  @Override
+  public URLInformationData getURLDetails(String correlationID, String xB3TraceId, String xB3SpanId, String urlId) {
+    LOG.info("Fetch URL details of urlId: {}", Encode.forJava(urlId));
+    UrlInformation urlInformation = repository.findByUrlId(urlId);
+    if (urlInformation == null) {
+      throw new ResourceNotFoundException("URL details not found for urlId:" + urlId);
+    }
+    LOG.info("Fetched URL details of urlId: {}", Encode.forJava(urlId));
+    return ResponseProcessor.processUrlDetailsResponse(urlInformation);
+  }
+
+  @Override
+  public URLInformationData getURLDetail(String correlationID, String xB3TraceId, String xB3SpanId, String urlId) {
+    LOG.info("Fetch URL details of urlId: {}", Encode.forJava(urlId));
+    UrlInformation urlInformation = repository.findByUrlId(urlId);
+    if (urlInformation == null) {
+      throw new ResourceNotFoundException("URL details not found for urlId:" + urlId);
+    }
+    LOG.info("Fetched URL details of urlId: {}", Encode.forJava(urlId));
+    URLInformationData urlInformationData = ResponseProcessor.processUrlDetailsResponse(urlInformation);
+    urlInformationData.getData().setUrlExpiry(urlInformation.getExpireOn().toString());
+    return urlInformationData;
+  }
+
+  @Override
+  public URLInformationData updateURLState(String correlationID, String xB3TraceId, String xB3SpanId, String urlId, UrlStateUpdateReqData urlStateUpdateReqData, String xUserId) throws DynamicUrlServiceException {
+    String userId = Encode.forJava(xUserId);
+    LOG.info("Received xUserId: {}", userId);
+    LOG.info("Updating URL state of urlId: {}", Encode.forJava(urlId));
+    UrlInformation urlInformation = repository.findByUrlId(urlId);
+    if (urlInformation == null) {
+      throw new ResourceNotFoundException("URL not found for urlId:" + urlId);
+    }
+    ValidationResult result = validate(urlInformation, OperationType.URL_STATE_UPDATE.name());
+    if (!result.isValid()) {
+      ServiceErrorCodes serviceErrorCodes = ServiceErrorCodes.valueOf(result.getErrorCode());
+      throw new UrlStateUpdateException("Url state update failed for urlId: " + urlId, serviceErrorCodes);
+    }
+    UrlStateUpdateRequest request = urlStateUpdateReqData.getData();
+    UrlStateUpdateService service = factory.getService(request.getStateAttribute().name());
+    return ResponseProcessor.processUrlDetailsResponse(service.updateUrlState(request, urlInformation, xUserId));
+  }
+
+  private ValidationResult validate(UrlInformation urlInformation, String serviceName) {
+    URLValidatorService urlValidatorService = factory.getService(serviceName);
+    List<UrlInformation> urls = new ArrayList<>();
+    urls.add(urlInformation);
+    return urlValidatorService.validate(urls);
+  }
+
+  private void handleValidationExceptionAndLogDetails(String generateUrlRequestParamName, String generateUrlRequestParam,String contactName){
+    LOG.warn("GenerateUrlRequest Object's {} {}",generateUrlRequestParamName, Encode.forJava(generateUrlRequestParam));
+    String maskedContact = MaskingUtil.maskContactInfo(Encode.forJava(contactName));
+    throw new InvalidRequestException("Url generation failed for contact: " + maskedContact, ServiceErrorCodes.valueOf(ServiceErrorCodes.BAD_REQUEST.name()));
+  }
+
+  private boolean validateUrlExpiry(String urlExpiry){
+    if(urlExpiry == null || urlExpiry.isEmpty())
+      return true;
+    else
+      return isDateBeforeTodaysDate(urlExpiry);
+  }
+
+
+
+  private boolean isDateBeforeTodaysDate(String urlExpiry){
+    try {
+      DateTimeFormatter dateformatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss[.SSS]");
+      DateTimeFormatter dateformatterGMT = dateformatter.withZone(ZoneId.of("GMT"));
+      ZonedDateTime currentZDT = ZonedDateTime.now();
+      String currentDateString = dateformatterGMT.format(currentZDT);
+      LocalDateTime currentLDT = LocalDateTime.from(dateformatterGMT.parse(currentDateString));
+      Timestamp currentTimestamp = Timestamp.valueOf(currentLDT);
+      LocalDateTime urlExpiryLDT = LocalDateTime.from(dateformatterGMT.parse(urlExpiry));
+      Timestamp urlExpiryTimestamp = Timestamp.valueOf(urlExpiryLDT);
+      LOG.warn("Is GenerateUrlRequest.urlExpiry date a past date: {}", urlExpiryTimestamp.before(currentTimestamp));
+      return urlExpiryTimestamp.before(currentTimestamp);
+    }catch(DateTimeParseException dtParseException){
+      throw new InvalidRequestException("Invalid Formatting of the "+urlExpiry+" date: ", ServiceErrorCodes.valueOf(ServiceErrorCodes.BAD_REQUEST.name()));
+    }
+  }
+}
