@@ -1,0 +1,132 @@
+package com.barclaycardus.dynamicurl.service.impl;
+
+import com.barclaycardus.dynamicurl.configuration.UrlConfig;
+import com.barclaycardus.dynamicurl.configuration.Workflow;
+import com.barclaycardus.dynamicurl.entity.UrlInformation;
+import com.barclaycardus.dynamicurl.model.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Profile;
+import org.springframework.stereotype.Service;
+
+import java.sql.Timestamp;
+
+@Service("URL_ACCESS_STATE")
+@Profile("aws")
+public class DynamoUrlAccessStateService extends UrlStateUpdateService {
+
+  private final DynamoDbClient dynamoDbClient;
+  private final UrlConfig urlConfig;
+  private final DynamicUrlServiceHelper helper;
+
+  private static final String TABLE_NAME = "your-table-name";
+
+  public DynamoUrlAccessStateService(
+      DynamoDbClient dynamoDbClient,
+      UrlConfig urlConfig,
+      DynamicUrlServiceHelper helper) {
+    this.dynamoDbClient = dynamoDbClient;
+    this.urlConfig = urlConfig;
+    this.helper = helper;
+  }
+
+  @Override
+  public UrlInformation updateUrlState(
+      UrlStateUpdateRequest request,
+      UrlInformation urlInformation,
+      String userId) {
+
+    String state = request.getStateAttributeValue();
+
+    long newAccessCount = safeLong(urlInformation.getUrlAccessCount()) + 1;
+
+    Integer failedCount = safeInt(urlInformation.getUrlAccessFailedCount());
+    Long lockedUpto = urlInformation.getLockedUpto();
+
+    if ("SUCCESS".equalsIgnoreCase(state)) {
+      failedCount = 0;
+      lockedUpto = null;
+    } else {
+      Workflow workflow = urlConfig.getWorkflow(
+          urlInformation.getWorkflowCode().toLowerCase());
+
+      failedCount = failedCount + 1;
+
+      if (lockedUpto != null) {
+        failedCount = 1;
+        lockedUpto = null;
+      }
+
+      if (failedCount >= workflow.getMaxRetryAllowed()) {
+        lockedUpto = helper.getLockedTime(workflow.getLookedUpTo()).getTime(); // epoch
+      }
+    }
+
+    // 🔥 Call atomic update
+    updateDynamo(urlInformation.getUrlId(),
+                 newAccessCount,
+                 failedCount,
+                 lockedUpto,
+                 urlInformation.getVersion());
+
+    // update object (optional)
+    urlInformation.setUrlAccessCount(newAccessCount);
+    urlInformation.setUrlAccessFailedCount(failedCount);
+    urlInformation.setLockedUpto(lockedUpto);
+    urlInformation.setVersion(urlInformation.getVersion() + 1);
+
+    return urlInformation;
+  }
+
+  private void updateDynamo(String urlId,
+                            long accessCount,
+                            int failedCount,
+                            Long lockedUpto,
+                            Long version) {
+
+    Map<String, AttributeValue> key = Map.of(
+        "urlId", AttributeValue.builder().s(urlId).build()
+    );
+
+    Map<String, AttributeValue> values = new HashMap<>();
+    values.put(":accessCount", AttributeValue.builder().n(String.valueOf(accessCount)).build());
+    values.put(":failedCount", AttributeValue.builder().n(String.valueOf(failedCount)).build());
+    values.put(":newVersion", AttributeValue.builder().n(String.valueOf(version + 1)).build());
+    values.put(":currentVersion", AttributeValue.builder().n(String.valueOf(version)).build());
+
+    StringBuilder updateExpr = new StringBuilder("SET urlAccessCount = :accessCount, ")
+        .append("urlAccessFailedCount = :failedCount, ")
+        .append("version = :newVersion ");
+
+    if (lockedUpto != null) {
+      values.put(":lockedUpto", AttributeValue.builder().n(String.valueOf(lockedUpto)).build());
+      updateExpr.append(", lockedUpto = :lockedUpto ");
+    } else {
+      updateExpr.append(" REMOVE lockedUpto ");
+    }
+
+    UpdateItemRequest request = UpdateItemRequest.builder()
+        .tableName(TABLE_NAME)
+        .key(key)
+        .updateExpression(updateExpr.toString())
+        .expressionAttributeValues(values)
+        // 🔥 Optimistic locking
+        .conditionExpression("version = :currentVersion")
+        .build();
+
+    try {
+      dynamoDbClient.updateItem(request);
+    } catch (ConditionalCheckFailedException e) {
+      throw new RuntimeException("Concurrent update detected for urlId: " + urlId, e);
+    }
+  }
+
+  private long safeLong(Long val) {
+    return val == null ? 0L : val;
+  }
+
+  private int safeInt(Integer val) {
+    return val == null ? 0 : val;
+  }
+}
